@@ -6,7 +6,7 @@ use core::time::Duration;
 
 use anyhow::{ensure, Context as _};
 use futures::{Stream, TryStreamExt as _};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt as _};
 use tokio::sync::mpsc;
 use tracing::{debug, info_span, instrument, warn, Instrument as _, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -19,7 +19,7 @@ use wasmtime::component::{types, Linker, ResourceTable, ResourceTableError};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wrpc_runtime_wasmtime::{
-    collect_component_resources, link_item, ServeExt as _, SharedResourceTable, WrpcView,
+    collect_component_resources, link_item, ServeExt as _, SharedResourceTable, WrpcView, call,
 };
 
 use crate::capability::{self, wrpc};
@@ -639,6 +639,7 @@ where
                                 let handler = handler.clone();
                                 let pre = self.instance_pre.clone();
                                 debug!(?instance_name, ?name, "serving instance function");
+                                println!("!!!!!!!!!!!!!!!!!!! {:?} ", ty);
                                 let func = srv
                                     .serve_function(
                                         move || {
@@ -758,6 +759,157 @@ where
         }
     }
 }
+
+
+impl<H, C> Instance<H, C>
+where
+    H: Handler,
+{
+    /// Invokes a function within the instantiated Wasm component.
+    pub async fn call<I, O>(
+        &self,
+        instance_name: &str,
+        func_name: &str,
+        rx: I,
+        tx: O,
+    ) -> anyhow::Result<()>
+    where
+        I: AsyncRead + wrpc_transport::Index<I> + Send + Sync + Unpin + 'static,
+        O: AsyncWrite + wrpc_transport::Index<O> + Send + Sync + Unpin + 'static,
+    {
+        println!(
+            "Instance::call invoked for instance `{}` and function `{}`",
+            instance_name, func_name
+        );
+
+        // Create a new store for the invocation
+        let mut store = new_store(
+            &self.engine,
+            self.handler.clone(),
+            self.max_execution_time,
+        );
+
+        // Instantiate the component
+        // This is a low-level Wasmtime operation, which is different from the instantiate used in invoke 
+        // It performs the actual Wasm instantiation in memory using the Wasmtime engine.
+        // It directly allocates a new Wasmtime Instance inside a Store, increments the component instance count, runs an Instantiator
+        // It returns a wasmtime::runtime::component::instance.
+        let instance = self
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .context("Failed to instantiate component")?;
+
+        // Get the function to call
+        // If instance_name is non-empty, find that export index
+        let idx = if instance_name.is_empty() {
+            None
+        } else {
+            let (_, export_idx) = self
+                .pre
+                .component()
+                .export_index(None, instance_name)
+                .with_context(|| format!("Export `{instance_name}` not found in the component"))?;
+            Some(export_idx)
+        };
+
+        // Find `func_name` from index
+        let (_, func_idx) = self
+            .pre
+            .component()
+            .export_index(idx.as_ref(), func_name)
+            .with_context(|| format!("Function `{func_name}` not found in the component"))?;
+
+        // Get the actual `Func` from the instantiated component
+        let func = instance
+            .get_func(&mut store, func_idx)
+            .with_context(|| format!("Failed to get function export `{func_name}`"))?;
+
+        println!(
+            "Function `{}` resolved successfully in the component",
+            func_name
+        );
+
+        // Get the top-level component type
+        let component_type = self.pre.component().component_type();
+        let mut component_func = None;
+
+        // If `instance_name` is non-empty, we expect a sub-instance export
+        if !instance_name.is_empty() {
+            // Find the `ComponentInstance` whose name == instance_name
+            for (export_name, export_item) in component_type.exports(&self.engine) {
+                if export_name == instance_name {
+                    // If it's actually a ComponentInstance, enumerate its exports
+                    if let types::ComponentItem::ComponentInstance(instance_ty) = export_item {
+                        // 2) Look for a ComponentFunc inside that instance with `func_name`
+                        for (sub_name, sub_export) in instance_ty.exports(&self.engine) {
+                            if let types::ComponentItem::ComponentFunc(func_ty) = sub_export {
+                                if sub_name == func_name {
+                                    component_func = Some(func_ty);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    break; // We found or didn’t find, but either way we stop searching top-level
+                }
+            }
+        } else {
+            // If `instance_name` is empty, just look for a top-level ComponentFunc
+            for (export_name, export) in component_type.exports(&self.engine) {
+                if let types::ComponentItem::ComponentFunc(func_ty) = export {
+                    if export_name == func_name {
+                        component_func = Some(func_ty);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Get `component_func` or return an error if it wasn't found
+        let component_func = component_func
+            .with_context(|| format!("Function `{}` not found in component exports", func_name))?;
+
+        println!("!!!!!!!!!!!!!!!!!!! {:?} ", component_func);
+
+        println!(
+            "Function `{}` found in component exports with parameters and results",
+            func_name
+        );
+
+        // Extract parameter and result types
+        let params_ty: Vec<_> = component_func.params().collect();
+        let results_ty: Vec<_> = component_func.results().collect();
+
+        println!("Params type {:?} ", params_ty);
+        println!("Results type{:?} ", results_ty);
+
+        let mut guest_resources = Vec::new();
+        collect_component_resources(&self.engine, &self.pre.component().component_type(), &mut guest_resources);
+
+        // Call the function with wrpc_runtime_wasmtime::call
+        call(
+            &mut store,
+            rx,
+            tx,
+            params_ty.iter(),
+            results_ty.iter(),
+            func,
+            &guest_resources,
+        )
+        .await
+        .context("Failed to invoke the function")?;
+
+        println!(
+            "Function `{}` executed successfully in instance `{}`",
+            func_name, instance_name
+        );
+
+        Ok(())
+    }
+}
+
+
 
 type TableResult<T> = Result<T, ResourceTableError>;
 

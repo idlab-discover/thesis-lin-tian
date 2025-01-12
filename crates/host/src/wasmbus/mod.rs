@@ -1440,6 +1440,7 @@ impl Host {
 
         // Map the imports to pull out the result types of the functions for lookup when invoking them
         let handler = Handler {
+            components: Arc::clone(&self.components),
             nats: Arc::clone(&self.rpc_nats),
             config_data: Arc::new(RwLock::new(config)),
             lattice: Arc::clone(&self.host_config.lattice),

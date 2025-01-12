@@ -24,12 +24,25 @@ use wasmcloud_runtime::component::{
 };
 use wasmcloud_tracing::context::TraceContextInjector;
 use wrpc_transport::InvokeExt as _;
+use wrpc_transport_nats::ParamWriter;
 
 use super::config::ConfigBundle;
 use super::{injector_to_headers, Features};
 
+// Added for in-host invocation
+use wasmcloud_core::ComponentId; // For ComponentId
+use crate::wasmbus::Component; // For Component from crates/host/src/wasmbus/mod.rs
+
+use wrpc_transport::Index;
+use wrpc_transport_nats::Reader;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
 #[derive(Clone, Debug)]
 pub struct Handler {
+    pub components: Arc<RwLock<HashMap<ComponentId, Arc<Component>>>>,
     pub nats: Arc<async_nats::Client>,
     // ConfigBundle is perfectly safe to pass around, but in order to update it on the fly, we need
     // to have it behind a lock since it can be cloned and because the `Actor` struct this gets
@@ -71,6 +84,7 @@ impl Handler {
     /// some fields shouldn't be copied between component instances such as link targets.
     pub fn copy_for_new(&self) -> Self {
         Handler {
+            components: self.components.clone(),
             nats: self.nats.clone(),
             config_data: self.config_data.clone(),
             secrets: self.secrets.clone(),
@@ -160,10 +174,209 @@ impl Bus for Handler {
     }
 }
 
+#[derive(Debug)]
+pub struct MyDuplexStream(pub tokio::io::DuplexStream);
+
+impl AsyncRead for MyDuplexStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MyDuplexStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl Index<MyDuplexStream> for MyDuplexStream {
+    fn index(&self, _path: &[usize]) -> std::result::Result<MyDuplexStream, anyhow::Error> {
+        Err(anyhow!("Index not implemented for MyDuplexStream"))
+    }
+}
+
+pub enum EitherOutgoing {
+    Local(MyDuplexStream),
+    Remote(ParamWriter),
+}
+
+impl AsyncWrite for EitherOutgoing {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            EitherOutgoing::Local(ref mut local) => {
+                let pinned = Pin::new(local);
+                let poll_result = pinned.poll_write(cx, data);
+                if let Poll::Ready(Ok(written)) = &poll_result {
+                    println!("EitherOutgoing::Local: wrote {} bytes", written);
+                }
+                poll_result
+            }
+            EitherOutgoing::Remote(ref mut remote) => {
+                let pinned = Pin::new(remote);
+                let poll_result = pinned.poll_write(cx, data);
+                if let Poll::Ready(Ok(written)) = &poll_result {
+                    println!("EitherOutgoing::Remote: wrote {} bytes", written);
+                }
+                poll_result
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherOutgoing::Local(ref mut local) => {
+                let pinned = Pin::new(local);
+                let poll_result = pinned.poll_flush(cx);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    println!("EitherOutgoing::Local: flush succeeded");
+                }
+                poll_result
+            }
+            EitherOutgoing::Remote(ref mut remote) => {
+                let pinned = Pin::new(remote);
+                let poll_result = pinned.poll_flush(cx);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    println!("EitherOutgoing::Remote: flush succeeded");
+                }
+                poll_result
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherOutgoing::Local(ref mut local) => {
+                let pinned = Pin::new(local);
+                let poll_result = pinned.poll_shutdown(cx);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    println!("EitherOutgoing::Local: shutdown succeeded");
+                }
+                poll_result
+            }
+            EitherOutgoing::Remote(ref mut remote) => {
+                let pinned = Pin::new(remote);
+                let poll_result = pinned.poll_shutdown(cx);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    println!("EitherOutgoing::Remote: shutdown succeeded");
+                }
+                poll_result
+            }
+        }
+    }
+
+}
+
+// Implement wrpc_transport::Index<EitherOutgoing> for EitherOutgoing
+impl Index<EitherOutgoing> for EitherOutgoing {
+    fn index(
+        &self,
+        path: &[usize],
+    ) -> std::result::Result<EitherOutgoing, anyhow::Error> {
+        match self {
+            EitherOutgoing::Local(local) => {
+                let new_local = local.index(path)?;
+                Ok(EitherOutgoing::Local(new_local))
+            }
+            EitherOutgoing::Remote(remote) => {
+                let new_remote = remote.index(path)?;
+                Ok(EitherOutgoing::Remote(new_remote))
+            }
+        }
+    }
+}
+
+pub enum EitherIncoming {
+    Local(MyDuplexStream),
+    Remote(Reader),
+}
+
+impl AsyncRead for EitherIncoming {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherIncoming::Local(ref mut local) => {
+                let pinned = Pin::new(local);
+                let poll_result = pinned.poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    let n = buf.filled().len();
+                    println!("EitherIncoming::Local: read {} bytes", n);
+                }
+                poll_result
+            }
+            EitherIncoming::Remote(ref mut remote) => {
+                let pinned = Pin::new(remote);
+                let poll_result = pinned.poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &poll_result {
+                    let n = buf.filled().len();
+                    println!("EitherIncoming::Remote: read {} bytes", n);
+                }
+                poll_result
+            }
+        }
+    }
+}
+
+// Implement wrpc_transport::Index<EitherIncoming> for EitherIncoming
+impl Index<EitherIncoming> for EitherIncoming {
+    fn index(
+        &self,
+        path: &[usize],
+    ) -> std::result::Result<EitherIncoming, anyhow::Error> {
+        match self {
+            EitherIncoming::Local(local) => {
+                let new_local = local.index(path)?;
+                Ok(EitherIncoming::Local(new_local))
+            }
+            EitherIncoming::Remote(remote) => {
+                let new_remote = remote.index(path)?;
+                Ok(EitherIncoming::Remote(new_remote))
+            }
+        }
+    }
+}
+
 impl wrpc_transport::Invoke for Handler {
     type Context = Option<ReplacedInstanceTarget>;
-    type Outgoing = <wrpc_transport_nats::Client as wrpc_transport::Invoke>::Outgoing;
-    type Incoming = <wrpc_transport_nats::Client as wrpc_transport::Invoke>::Incoming;
+    // type Outgoing = <wrpc_transport_nats::Client as wrpc_transport::Invoke>::Outgoing;
+    // type Incoming = <wrpc_transport_nats::Client as wrpc_transport::Invoke>::Incoming;
+    type Outgoing = EitherOutgoing;
+    type Incoming = EitherIncoming;
+
 
     #[instrument(level = "debug", skip_all)]
     async fn invoke<P>(
@@ -177,8 +390,28 @@ impl wrpc_transport::Invoke for Handler {
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
+
+        // Print some arguments to figure out how it works
+        {
+            println!("Lattice: {}", self.lattice);
+            println!("Component ID: {}", self.component_id);
+
+            let components = self.components.read().await;
+            println!("Components: {:?}", components.keys().collect::<Vec<_>>());
+
+            let targets = self.targets.read().await;
+            println!("Targets: {:?}", targets);
+
+            let instance_links = self.instance_links.read().await;
+            println!("Instance Links: {:?}", instance_links);
+        }
+
+        // Added for in-host invocation. Mind the redundancy
+        let components = self.components.read().await;
+
         let links = self.instance_links.read().await;
         let targets = self.targets.read().await;
+        
 
         let target_instance = match target_instance {
             Some(
@@ -193,9 +426,13 @@ impl wrpc_transport::Invoke for Handler {
             None => instance.split_once('@').map_or(instance, |(l, _)| l),
         };
 
+        println!("Target instance: {}", target_instance);
+
         let link_name = targets
             .get(target_instance)
             .map_or("default", AsRef::as_ref);
+
+        println!("Link name: {}", link_name);
 
         let instances = links.get(link_name).with_context(|| {
             warn!(
@@ -208,6 +445,8 @@ impl wrpc_transport::Invoke for Handler {
             format!("link `{link_name}` not found for instance `{target_instance}`")
         })?;
 
+        println!("Instances: {:?}", instances);
+
         // Determine the lattice target ID we should be sending to
         let id = instances.get(target_instance).with_context(||{
             warn!(
@@ -219,6 +458,53 @@ impl wrpc_transport::Invoke for Handler {
             format!("failed to call `{func}` in instance `{instance}` (failed to find a configured link with name `{link_name}` from component `{id}`, please check your configuration)", id = self.component_id)
         })?;
 
+        println!("Lattice target ID: {}", id);
+
+        if let Some(component) = components.get(id.as_ref()) {
+            println!("In host invocation");
+
+            // Print the `func` and `params` arguments
+            println!("Function to invoke: {:?}", func);
+            println!("Parameters (bytes): {:?}", params);
+
+            // Create two pairs of DuplexStreams
+            // Use tokio::io::duplex instead of std::sync::mpsc::channel
+            // To improve
+            let (func_in_rx, func_in_tx) = tokio::io::duplex(1024);   // For the function's input
+            let (func_out_rx, func_out_tx) = tokio::io::duplex(1024); // For the function's output
+
+            // Wrap them with custom DuplexStream with Index
+            // From the host’s perspective
+            let mut outgoing_stream = MyDuplexStream(func_in_tx); // We write here, function reads
+            let incoming_stream = MyDuplexStream(func_out_rx);    // Function writes here, we read
+
+            // Write request bytes to the `outgoing_stream` so the function sees them
+            outgoing_stream.write_all(&params).await?;
+            
+            // Shutdown the writer to indicate EOF to the callee
+            outgoing_stream.shutdown().await?;
+
+            // Call the function with (rx, tx) = (func_in_rx, func_out_tx)
+            // The instantiate methods is a high-level constructor, which is different from the instantiate_async used in Instance::call.
+            // The instantiate method doesn't do any Wasmtime store allocation or imports hooking up
+            component
+                .instantiate(component.handler.copy_for_new(), component.events.clone())
+                .call(
+                    instance,
+                    func,
+                    MyDuplexStream(func_in_rx),  // Function is reading from func_in_rx
+                    MyDuplexStream(func_out_tx), // Function is writing to func_out_tx
+                )
+                .await?;
+
+            // `outgoing_stream` is the host’s writer => EitherOutgoing::Local
+            // `incoming_stream` is the host’s reader => EitherIncoming::Local
+            return Ok((
+                EitherOutgoing::Local(outgoing_stream),
+                EitherIncoming::Local(incoming_stream),
+            )); 
+        }
+
         let mut headers = injector_to_headers(&TraceContextInjector::default_with_span());
         headers.insert("source-id", &*self.component_id);
         headers.insert("link-name", link_name);
@@ -228,11 +514,19 @@ impl wrpc_transport::Invoke for Handler {
             None,
         )
         .await?;
-        nats.timeout(self.invocation_timeout)
-            .invoke(Some(headers), instance, func, params, paths)
-            .await
+        let (remote_outgoing, remote_incoming) = nats
+        .timeout(self.invocation_timeout)
+        .invoke(Some(headers), instance, func, params, paths)
+        .await?;
+
+        // Wrap them in the `Remote` variant of the enums
+        Ok((
+            EitherOutgoing::Remote(remote_outgoing),
+            EitherIncoming::Remote(remote_incoming),
+        ))
     }
 }
+
 
 #[async_trait]
 impl Config for Handler {

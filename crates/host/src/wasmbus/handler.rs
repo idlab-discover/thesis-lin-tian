@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use secrecy::Secret;
 use tokio::sync::RwLock;
-use tracing::{error, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use wasmcloud_runtime::capability::logging::logging;
 use wasmcloud_runtime::capability::secrets::store::SecretValue;
 use wasmcloud_runtime::capability::{
@@ -174,7 +174,7 @@ impl Bus for Handler {
     }
 }
 
-#[derive(Debug)]
+/* #[derive(Debug)]
 pub struct MyDuplexStream(pub tokio::io::DuplexStream);
 
 impl AsyncRead for MyDuplexStream {
@@ -368,7 +368,222 @@ impl Index<EitherIncoming> for EitherIncoming {
             }
         }
     }
+} */
+
+
+use tokio::sync::mpsc;
+
+/// A writer side of a bounded MPSC channel, implementing `AsyncWrite`.
+pub struct MpscWriter {
+    sender: mpsc::Sender<Bytes>,
 }
+
+impl MpscWriter {
+    /// Create a bounded channel for "host → function" usage, returning `(writer, reader)`.
+    /// - `writer` implements `AsyncWrite` (the host side).
+    /// - `reader` implements `AsyncRead` (the function side).
+    pub fn channel(capacity: usize) -> (MpscWriter, MpscReader) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let writer = MpscWriter { sender: tx };
+        let reader = MpscReader {
+            receiver: rx,
+            recv_buf: None,
+        };
+        (writer, reader)
+    }
+}
+
+use tokio::sync::mpsc::error::TrySendError;
+
+impl AsyncWrite for MpscWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // Convert the data to a Bytes object.
+        let bytes = Bytes::copy_from_slice(buf);
+
+        // Attempt to send immediately without blocking.
+        match self.sender.try_send(bytes) {
+            Ok(()) => {
+                // We wrote all data
+                Poll::Ready(Ok(buf.len()))
+            }
+            Err(TrySendError::Full(_bytes)) => {
+                // The channel is at capacity
+                let err = std::io::Error::new(std::io::ErrorKind::WouldBlock, "Channel is full");
+                Poll::Ready(Err(err))
+            }
+            Err(TrySendError::Closed(_bytes)) => {
+                let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed");
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // No explicit flush logic for MPSC
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Indicate we're done sending by dropping the sender
+        // Tokio 1.42 doesn't have close_channel()
+        drop(self.sender.clone());
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// The reader side of the MPSC channel, implementing `AsyncRead`.
+pub struct MpscReader {
+    receiver: mpsc::Receiver<Bytes>,
+    recv_buf: Option<Bytes>,
+}
+
+
+impl AsyncRead for MpscReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // If we have leftover data from a prior read, fill from that first.
+        if let Some(mut leftover) = self.recv_buf.take() {
+            let to_copy = std::cmp::min(leftover.len(), buf.remaining());
+            // Use split_to(...) to separate the consumed portion
+            let head = leftover.split_to(to_copy);
+            buf.put_slice(&head);
+            if leftover.len() > 0 {
+                self.recv_buf = Some(leftover);
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Otherwise, get a fresh chunk from the channel
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(mut chunk)) => {
+                let to_copy = std::cmp::min(chunk.len(), buf.remaining());
+                let head = chunk.split_to(to_copy);
+                buf.put_slice(&head);
+                if chunk.len() > 0 {
+                    self.recv_buf = Some(chunk);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                // Channel closed => EOF
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+
+impl Index<MpscWriter> for MpscWriter {
+    fn index(&self, _path: &[usize]) -> Result<MpscWriter, anyhow::Error> {
+        Err(anyhow!("Index not implemented for MpscWriter"))
+    }
+}
+
+impl Index<MpscReader> for MpscReader {
+    fn index(&self, _path: &[usize]) -> Result<MpscReader, anyhow::Error> {
+        Err(anyhow!("Index not implemented for MpscReader"))
+    }
+}
+
+
+pub enum EitherOutgoing {
+    LocalMpsc(MpscWriter),
+    Remote(ParamWriter),
+}
+
+pub enum EitherIncoming {
+    LocalMpsc(MpscReader),
+    Remote(Reader),
+}
+
+impl Index<EitherOutgoing> for EitherOutgoing {
+    fn index(&self, _path: &[usize]) -> Result<EitherOutgoing, anyhow::Error> {
+        match self {
+            EitherOutgoing::LocalMpsc(_writer) => {
+                // Do a trivial error or return the same writer if desired
+                Err(anyhow!("Index not implemented for MpscWriter in EitherOutgoing"))
+            }
+            EitherOutgoing::Remote(remote) => {
+                // We can call `remote.index(path)` if ParamWriter also implements Index<ParamWriter>,
+                let new_remote = remote.index(_path)?;
+                Ok(EitherOutgoing::Remote(new_remote))
+            }
+        }
+    }
+}
+
+impl Index<EitherIncoming> for EitherIncoming {
+    fn index(&self, _path: &[usize]) -> Result<EitherIncoming, anyhow::Error> {
+        match self {
+            EitherIncoming::LocalMpsc(_reader) => {
+                Err(anyhow!("Index not implemented for MpscReader in EitherIncoming"))
+            }
+            EitherIncoming::Remote(r) => {
+                let new_r = r.index(_path)?;
+                Ok(EitherIncoming::Remote(new_r))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for EitherOutgoing {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            EitherOutgoing::LocalMpsc(writer) => Pin::new(writer).poll_write(cx, data),
+            EitherOutgoing::Remote(remote) => Pin::new(remote).poll_write(cx, data),
+        }
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherOutgoing::LocalMpsc(writer) => Pin::new(writer).poll_flush(cx),
+            EitherOutgoing::Remote(remote) => Pin::new(remote).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherOutgoing::LocalMpsc(writer) => Pin::new(writer).poll_shutdown(cx),
+            EitherOutgoing::Remote(remote) => Pin::new(remote).poll_shutdown(cx),
+        }
+    }
+}
+
+impl AsyncRead for EitherIncoming {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            EitherIncoming::LocalMpsc(reader) => Pin::new(reader).poll_read(cx, buf),
+            EitherIncoming::Remote(r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
 
 impl wrpc_transport::Invoke for Handler {
     type Context = Option<ReplacedInstanceTarget>;
@@ -390,23 +605,6 @@ impl wrpc_transport::Invoke for Handler {
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
-
-        // Print some arguments to figure out how it works
-        {
-            println!("Lattice: {}", self.lattice);
-            println!("Component ID: {}", self.component_id);
-
-            let components = self.components.read().await;
-            println!("Components: {:?}", components.keys().collect::<Vec<_>>());
-
-            let targets = self.targets.read().await;
-            println!("Targets: {:?}", targets);
-
-            let instance_links = self.instance_links.read().await;
-            println!("Instance Links: {:?}", instance_links);
-        }
-
-        // Added for in-host invocation. Mind the redundancy
         let components = self.components.read().await;
 
         let links = self.instance_links.read().await;
@@ -426,13 +624,13 @@ impl wrpc_transport::Invoke for Handler {
             None => instance.split_once('@').map_or(instance, |(l, _)| l),
         };
 
-        println!("Target instance: {}", target_instance);
+        debug!("Target instance: {}", target_instance);
 
         let link_name = targets
             .get(target_instance)
             .map_or("default", AsRef::as_ref);
 
-        println!("Link name: {}", link_name);
+        debug!("Link name: {}", link_name);
 
         let instances = links.get(link_name).with_context(|| {
             warn!(
@@ -445,7 +643,7 @@ impl wrpc_transport::Invoke for Handler {
             format!("link `{link_name}` not found for instance `{target_instance}`")
         })?;
 
-        println!("Instances: {:?}", instances);
+        debug!("Instances: {:?}", instances);
 
         // Determine the lattice target ID we should be sending to
         let id = instances.get(target_instance).with_context(||{
@@ -458,19 +656,19 @@ impl wrpc_transport::Invoke for Handler {
             format!("failed to call `{func}` in instance `{instance}` (failed to find a configured link with name `{link_name}` from component `{id}`, please check your configuration)", id = self.component_id)
         })?;
 
-        println!("Lattice target ID: {}", id);
-
+        debug!("Lattice target ID: {}", id);
+ 
         if let Some(component) = components.get(id.as_ref()) {
-            println!("In host invocation");
+            debug!("In host invocation");
 
             // Print the `func` and `params` arguments
-            println!("Function to invoke: {:?}", func);
-            println!("Parameters (bytes): {:?}", params);
+            debug!("Function to invoke: {:?}", func);
+            debug!("Parameters (bytes): {:?}", params);
 
             // Create two pairs of DuplexStreams
             // Use tokio::io::duplex instead of std::sync::mpsc::channel
             // To improve
-            let (func_in_rx, func_in_tx) = tokio::io::duplex(1024);   // For the function's input
+/*             let (func_in_rx, func_in_tx) = tokio::io::duplex(1024);   // For the function's input
             let (func_out_rx, func_out_tx) = tokio::io::duplex(1024); // For the function's output
 
             // Wrap them with custom DuplexStream with Index
@@ -499,7 +697,34 @@ impl wrpc_transport::Invoke for Handler {
             return Ok((
                 EitherOutgoing::Local(outgoing_stream),
                 EitherIncoming::Local(incoming_stream),
-            )); 
+            ));  */
+            let (mut host2func_writer, host2func_reader) = MpscWriter::channel(1);
+            let (func2host_writer, func2host_reader) = MpscWriter::channel(1);
+
+            // write params to host2func_writer
+            host2func_writer.write_all(&params).await?;
+
+            // Call the local function using the `component`:
+            // The function reads from `host2func_reader`
+            // The function writes into `func2host_writer`
+            component
+                .instantiate(component.handler.copy_for_new(), component.events.clone())
+                .call(
+                    instance,
+                    func,
+                    host2func_reader,  // function sees this as its "rx"
+                    func2host_writer,  // function sees this as its "tx"
+                )
+                .await?;
+
+
+            // Wrap the host’s writer/reader in `EitherOutgoing::LocalMpsc`, `EitherIncoming::LocalMpsc`.
+            // Because from the host's perspective:
+            //  - "outgoing" = the writer we used to send data to the function
+            //  - "incoming" = the reader we use to read data from the function
+            let outgoing = EitherOutgoing::LocalMpsc(host2func_writer);
+            let incoming = EitherIncoming::LocalMpsc(func2host_reader);
+            return Ok((outgoing, incoming));
         }
 
         let mut headers = injector_to_headers(&TraceContextInjector::default_with_span());

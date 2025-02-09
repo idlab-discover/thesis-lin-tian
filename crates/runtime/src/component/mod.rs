@@ -639,7 +639,6 @@ where
                                 let handler = handler.clone();
                                 let pre = self.instance_pre.clone();
                                 debug!(?instance_name, ?name, "serving instance function");
-                                println!("!!!!!!!!!!!!!!!!!!! {:?} ", ty);
                                 let func = srv
                                     .serve_function(
                                         move || {
@@ -777,7 +776,7 @@ where
         I: AsyncRead + wrpc_transport::Index<I> + Send + Sync + Unpin + 'static,
         O: AsyncWrite + wrpc_transport::Index<O> + Send + Sync + Unpin + 'static,
     {
-        println!(
+        debug!(
             "Instance::call invoked for instance `{}` and function `{}`",
             instance_name, func_name
         );
@@ -825,7 +824,7 @@ where
             .get_func(&mut store, func_idx)
             .with_context(|| format!("Failed to get function export `{func_name}`"))?;
 
-        println!(
+        debug!(
             "Function `{}` resolved successfully in the component",
             func_name
         );
@@ -841,7 +840,7 @@ where
                 if export_name == instance_name {
                     // If it's actually a ComponentInstance, enumerate its exports
                     if let types::ComponentItem::ComponentInstance(instance_ty) = export_item {
-                        // 2) Look for a ComponentFunc inside that instance with `func_name`
+                        // Look for a ComponentFunc inside that instance with `func_name`
                         for (sub_name, sub_export) in instance_ty.exports(&self.engine) {
                             if let types::ComponentItem::ComponentFunc(func_ty) = sub_export {
                                 if sub_name == func_name {
@@ -851,7 +850,7 @@ where
                             }
                         }
                     }
-                    break; // We found or didn’t find, but either way we stop searching top-level
+                    break; // Found or not found, but either way stop searching top-level
                 }
             }
         } else {
@@ -870,9 +869,7 @@ where
         let component_func = component_func
             .with_context(|| format!("Function `{}` not found in component exports", func_name))?;
 
-        println!("!!!!!!!!!!!!!!!!!!! {:?} ", component_func);
-
-        println!(
+        debug!(
             "Function `{}` found in component exports with parameters and results",
             func_name
         );
@@ -881,8 +878,8 @@ where
         let params_ty: Vec<_> = component_func.params().collect();
         let results_ty: Vec<_> = component_func.results().collect();
 
-        println!("Params type {:?} ", params_ty);
-        println!("Results type{:?} ", results_ty);
+        debug!("Params type {:?} ", params_ty);
+        debug!("Results type{:?} ", results_ty);
 
         let mut guest_resources = Vec::new();
         collect_component_resources(&self.engine, &self.pre.component().component_type(), &mut guest_resources);
@@ -900,7 +897,7 @@ where
         .await
         .context("Failed to invoke the function")?;
 
-        println!(
+        debug!(
             "Function `{}` executed successfully in instance `{}`",
             func_name, instance_name
         );

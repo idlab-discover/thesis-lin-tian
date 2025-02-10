@@ -39,6 +39,7 @@ use wrpc_transport_nats::Reader;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub struct Handler {
@@ -174,204 +175,6 @@ impl Bus for Handler {
     }
 }
 
-/* #[derive(Debug)]
-pub struct MyDuplexStream(pub tokio::io::DuplexStream);
-
-impl AsyncRead for MyDuplexStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for MyDuplexStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, data)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
-
-impl Index<MyDuplexStream> for MyDuplexStream {
-    fn index(&self, _path: &[usize]) -> std::result::Result<MyDuplexStream, anyhow::Error> {
-        Err(anyhow!("Index not implemented for MyDuplexStream"))
-    }
-}
-
-pub enum EitherOutgoing {
-    Local(MyDuplexStream),
-    Remote(ParamWriter),
-}
-
-impl AsyncWrite for EitherOutgoing {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            EitherOutgoing::Local(ref mut local) => {
-                let pinned = Pin::new(local);
-                let poll_result = pinned.poll_write(cx, data);
-                if let Poll::Ready(Ok(written)) = &poll_result {
-                    println!("EitherOutgoing::Local: wrote {} bytes", written);
-                }
-                poll_result
-            }
-            EitherOutgoing::Remote(ref mut remote) => {
-                let pinned = Pin::new(remote);
-                let poll_result = pinned.poll_write(cx, data);
-                if let Poll::Ready(Ok(written)) = &poll_result {
-                    println!("EitherOutgoing::Remote: wrote {} bytes", written);
-                }
-                poll_result
-            }
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            EitherOutgoing::Local(ref mut local) => {
-                let pinned = Pin::new(local);
-                let poll_result = pinned.poll_flush(cx);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    println!("EitherOutgoing::Local: flush succeeded");
-                }
-                poll_result
-            }
-            EitherOutgoing::Remote(ref mut remote) => {
-                let pinned = Pin::new(remote);
-                let poll_result = pinned.poll_flush(cx);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    println!("EitherOutgoing::Remote: flush succeeded");
-                }
-                poll_result
-            }
-        }
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            EitherOutgoing::Local(ref mut local) => {
-                let pinned = Pin::new(local);
-                let poll_result = pinned.poll_shutdown(cx);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    println!("EitherOutgoing::Local: shutdown succeeded");
-                }
-                poll_result
-            }
-            EitherOutgoing::Remote(ref mut remote) => {
-                let pinned = Pin::new(remote);
-                let poll_result = pinned.poll_shutdown(cx);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    println!("EitherOutgoing::Remote: shutdown succeeded");
-                }
-                poll_result
-            }
-        }
-    }
-
-}
-
-// Implement wrpc_transport::Index<EitherOutgoing> for EitherOutgoing
-impl Index<EitherOutgoing> for EitherOutgoing {
-    fn index(
-        &self,
-        path: &[usize],
-    ) -> std::result::Result<EitherOutgoing, anyhow::Error> {
-        match self {
-            EitherOutgoing::Local(local) => {
-                let new_local = local.index(path)?;
-                Ok(EitherOutgoing::Local(new_local))
-            }
-            EitherOutgoing::Remote(remote) => {
-                let new_remote = remote.index(path)?;
-                Ok(EitherOutgoing::Remote(new_remote))
-            }
-        }
-    }
-}
-
-pub enum EitherIncoming {
-    Local(MyDuplexStream),
-    Remote(Reader),
-}
-
-impl AsyncRead for EitherIncoming {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            EitherIncoming::Local(ref mut local) => {
-                let pinned = Pin::new(local);
-                let poll_result = pinned.poll_read(cx, buf);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    let n = buf.filled().len();
-                    println!("EitherIncoming::Local: read {} bytes", n);
-                }
-                poll_result
-            }
-            EitherIncoming::Remote(ref mut remote) => {
-                let pinned = Pin::new(remote);
-                let poll_result = pinned.poll_read(cx, buf);
-                if let Poll::Ready(Ok(())) = &poll_result {
-                    let n = buf.filled().len();
-                    println!("EitherIncoming::Remote: read {} bytes", n);
-                }
-                poll_result
-            }
-        }
-    }
-}
-
-// Implement wrpc_transport::Index<EitherIncoming> for EitherIncoming
-impl Index<EitherIncoming> for EitherIncoming {
-    fn index(
-        &self,
-        path: &[usize],
-    ) -> std::result::Result<EitherIncoming, anyhow::Error> {
-        match self {
-            EitherIncoming::Local(local) => {
-                let new_local = local.index(path)?;
-                Ok(EitherIncoming::Local(new_local))
-            }
-            EitherIncoming::Remote(remote) => {
-                let new_remote = remote.index(path)?;
-                Ok(EitherIncoming::Remote(new_remote))
-            }
-        }
-    }
-} */
-
-
-use tokio::sync::mpsc;
 
 /// A writer side of a bounded MPSC channel, implementing `AsyncWrite`.
 pub struct MpscWriter {
@@ -546,6 +349,9 @@ impl AsyncWrite for EitherOutgoing {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+
+        println!("data in EitherOutgoing: {:?}", data);
+
         match self.get_mut() {
             EitherOutgoing::LocalMpsc(writer) => Pin::new(writer).poll_write(cx, data),
             EitherOutgoing::Remote(remote) => Pin::new(remote).poll_write(cx, data),
@@ -665,39 +471,6 @@ impl wrpc_transport::Invoke for Handler {
             debug!("Function to invoke: {:?}", func);
             debug!("Parameters (bytes): {:?}", params);
 
-            // Create two pairs of DuplexStreams
-            // Use tokio::io::duplex instead of std::sync::mpsc::channel
-            // To improve
-/*             let (func_in_rx, func_in_tx) = tokio::io::duplex(1024);   // For the function's input
-            let (func_out_rx, func_out_tx) = tokio::io::duplex(1024); // For the function's output
-
-            // Wrap them with custom DuplexStream with Index
-            // From the host’s perspective
-            let mut outgoing_stream = MyDuplexStream(func_in_tx); // We write here, function reads
-            let incoming_stream = MyDuplexStream(func_out_rx);    // Function writes here, we read
-
-            // Write request bytes to the `outgoing_stream` so the function sees them
-            outgoing_stream.write_all(&params).await?;
-
-            // Call the function with (rx, tx) = (func_in_rx, func_out_tx)
-            // The instantiate methods is a high-level constructor, which is different from the instantiate_async used in Instance::call.
-            // The instantiate method doesn't do any Wasmtime store allocation or imports hooking up
-            component
-                .instantiate(component.handler.copy_for_new(), component.events.clone())
-                .call(
-                    instance,
-                    func,
-                    MyDuplexStream(func_in_rx),  // Function is reading from func_in_rx
-                    MyDuplexStream(func_out_tx), // Function is writing to func_out_tx
-                )
-                .await?;
-
-            // `outgoing_stream` is the host’s writer => EitherOutgoing::Local
-            // `incoming_stream` is the host’s reader => EitherIncoming::Local
-            return Ok((
-                EitherOutgoing::Local(outgoing_stream),
-                EitherIncoming::Local(incoming_stream),
-            ));  */
             let (mut host2func_writer, host2func_reader) = MpscWriter::channel(1);
             let (func2host_writer, func2host_reader) = MpscWriter::channel(1);
 

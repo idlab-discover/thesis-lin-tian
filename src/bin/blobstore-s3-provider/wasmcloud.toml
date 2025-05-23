@@ -1,0 +1,11 @@
+name = "Blobstore S3"
+language = "rust"
+version = "0.10.0"
+type = "provider"
+
+[rust]
+target_dir = "../../../"
+
+[provider]
+bin_name = "blobstore-s3-provider"
+vendor = "wasmCloud"

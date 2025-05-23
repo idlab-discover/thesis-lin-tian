@@ -1,0 +1,47 @@
+[package]
+name = "wasmcloud-core"
+version = "0.15.0"
+description = "wasmCloud core functionality shared throughout the ecosystem"
+
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = [
+    "hyper-rustls",
+    "oci",
+    "reqwest",
+    "rustls-native-certs",
+    "webpki-roots",
+]
+hyper-rustls = ["dep:hyper-rustls", "dep:hyper-util"]
+otel = []
+oci = ["dep:oci-client", "dep:oci-wasm"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+async-nats = { workspace = true, features = ["ring"] }
+hyper-rustls = { workspace = true, features = [
+    "http2",
+    "ring",
+], optional = true }
+hyper-util = { workspace = true, optional = true }
+oci-client = { workspace = true, features = ["rustls-tls"], optional = true }
+oci-wasm = { workspace = true, features = ["rustls-tls"], optional = true }
+once_cell = { workspace = true }
+provider-archive = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
+rustls = { workspace = true, features = ["std"] }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true }
+semver = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+wascap = { workspace = true }
+webpki-roots = { workspace = true, optional = true }
